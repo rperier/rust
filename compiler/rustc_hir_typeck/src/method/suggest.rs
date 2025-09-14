@@ -4094,11 +4094,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     fn detect_and_explain_multiple_crate_versions_of_trait_item(
         &self,
-        err: &mut Diag<'_>,
-        item_def_id: DefId,
-        hir_id: hir::HirId,
-        rcvr_ty: Option<Ty<'_>>,
+        _err: &mut Diag<'_>,
+        _item_def_id: DefId,
+        _hir_id: hir::HirId,
+        _rcvr_ty: Option<Ty<'_>>,
     ) -> bool {
+        return false;
+        /*
         let hir_id = self.tcx.parent_hir_id(hir_id);
         let Some(traits) = self.tcx.in_scope_traits(hir_id) else { return false };
         if traits.is_empty() {
@@ -4151,6 +4153,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
         err.span_note(multi_span, msg);
         true
+        */
     }
 
     /// issue #102320, for `unwrap_or` with closure as argument, suggest `unwrap_or_else`

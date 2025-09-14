@@ -2426,13 +2426,20 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             trait_impls
         };
 
+        let krate = self.tcx.crate_name(trait_pred.def_id().krate);
+        let name = self.tcx.item_name(trait_pred.def_id());
         let required_trait_path = self.tcx.def_path_str(trait_pred.def_id());
         let traits_with_same_path: UnordSet<_> = self
             .tcx
             .visible_traits()
-            .filter(|trait_def_id| *trait_def_id != trait_pred.def_id())
+            .filter(|trait_def_id| {
+                *trait_def_id != trait_pred.def_id()
+                    && trait_def_id.krate != trait_pred.def_id().krate
+                    && (self.tcx.def_path_str(trait_def_id) == required_trait_path
+                        || self.tcx.crate_name(trait_def_id.krate) == krate
+                            && self.tcx.item_name(trait_def_id) == name)
+            })
             .map(|trait_def_id| (self.tcx.def_path_str(trait_def_id), trait_def_id))
-            .filter(|(p, _)| *p == required_trait_path)
             .collect();
 
         let traits_with_same_path =
@@ -2462,24 +2469,6 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         }
 
         let trait_def_id = trait_pred.def_id();
-        let trait_name = self.tcx.item_name(trait_def_id);
-        let trait_krate_name = self.tcx.crate_name(trait_def_id.krate);
-
-        // If there are multiple different versions of a crate in the dependency graph, there is already
-        // a suggestion designed for this purpose in the rustc_hir_typeck compiler crate
-        if self
-            .tcx
-            .all_traits_including_private()
-            .find(|def_id| {
-                def_id.krate != trait_def_id.krate
-                    && self.tcx.crate_name(def_id.krate) == trait_krate_name
-                    && self.tcx.item_name(def_id) == trait_name
-            })
-            .is_some()
-        {
-            return false;
-        }
-
         let trait_has_same_params = |other_trait_def_id: DefId| -> bool {
             let trait_generics = self.tcx.generics_of(trait_def_id);
             let other_trait_generics = self.tcx.generics_of(other_trait_def_id);
