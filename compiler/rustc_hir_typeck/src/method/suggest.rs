@@ -666,6 +666,383 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
     }
 
+    fn suggest_method_call_annotation(
+        &self,
+        err: &mut Diag<'_>,
+        span: Span,
+        rcvr_ty: Ty<'tcx>,
+        item_ident: Ident,
+        mode: Mode,
+        source: SelfSource<'tcx>,
+        expected: Expectation<'tcx>,
+    ) {
+        if let Mode::MethodCall = mode
+            && let SelfSource::MethodCall(cal) = source
+        {
+            self.suggest_await_before_method(
+                err,
+                item_ident,
+                rcvr_ty,
+                cal,
+                span,
+                expected.only_has_type(self),
+            );
+        }
+
+        self.suggest_on_pointer_type(err, source, rcvr_ty, item_ident);
+
+        if let SelfSource::MethodCall(rcvr_expr) = source {
+            self.suggest_fn_call(err, rcvr_expr, rcvr_ty, |output_ty| {
+                let call_expr = self.tcx.hir_expect_expr(self.tcx.parent_hir_id(rcvr_expr.hir_id));
+                let probe = self.lookup_probe_for_diagnostic(
+                    item_ident,
+                    output_ty,
+                    call_expr,
+                    ProbeScope::AllTraits,
+                    expected.only_has_type(self),
+                );
+                probe.is_ok()
+            });
+            self.note_internal_mutation_in_method(
+                err,
+                rcvr_expr,
+                expected.to_option(self),
+                rcvr_ty,
+            );
+        }
+    }
+
+    fn suggest_static_method_candidates(
+        &self,
+        err: &mut Diag<'_>,
+        span: Span,
+        rcvr_ty: Ty<'tcx>,
+        item_ident: Ident,
+        source: SelfSource<'tcx>,
+        args: Option<&'tcx [hir::Expr<'tcx>]>,
+        sugg_span: Span,
+        no_match_data: &NoMatchData<'tcx>,
+    ) -> Vec<CandidateSource> {
+        let mut static_candidates = no_match_data.static_candidates.clone();
+
+        // `static_candidates` may have same candidates appended by
+        // inherent and extension, which may result in incorrect
+        // diagnostic.
+        static_candidates.dedup();
+
+        if !static_candidates.is_empty() {
+            err.note(
+                "found the following associated functions; to be used as methods, \
+                 functions must have a `self` parameter",
+            );
+            err.span_label(span, "this is an associated function, not a method");
+        }
+        if static_candidates.len() == 1 {
+            self.suggest_associated_call_syntax(
+                err,
+                &static_candidates,
+                rcvr_ty,
+                source,
+                item_ident,
+                args,
+                sugg_span,
+            );
+            self.note_candidates_on_method_error(
+                rcvr_ty,
+                item_ident,
+                source,
+                args,
+                span,
+                err,
+                &mut static_candidates,
+                None,
+            );
+        } else if static_candidates.len() > 1 {
+            self.note_candidates_on_method_error(
+                rcvr_ty,
+                item_ident,
+                source,
+                args,
+                span,
+                err,
+                &mut static_candidates,
+                Some(sugg_span),
+            );
+        }
+        static_candidates
+    }
+
+    fn suggest_unsatisfied_ty_or_trait(
+        &self,
+        err: &mut Diag<'_>,
+        span: Span,
+        rcvr_ty: Ty<'tcx>,
+        item_ident: Ident,
+        item_kind: &str,
+        source: SelfSource<'tcx>,
+        unsatisfied_predicates: &UnsatisfiedPredicates<'tcx>,
+        restrict_type_params: &mut bool,
+        suggested_derive: &mut bool,
+        unsatisfied_bounds: &mut bool,
+        custom_span_label: &mut bool,
+        bound_spans: &mut SortedMap<Span, Vec<String>>,
+    ) -> bool {
+        let tcx = self.tcx;
+
+        if item_ident.name == sym::count && self.is_slice_ty(rcvr_ty, span) {
+            let msg = "consider using `len` instead";
+            if let SelfSource::MethodCall(_expr) = source {
+                err.span_suggestion_short(span, msg, "len", Applicability::MachineApplicable);
+            } else {
+                err.span_label(span, msg);
+            }
+            if let Some(iterator_trait) = self.tcx.get_diagnostic_item(sym::Iterator) {
+                let iterator_trait = self.tcx.def_path_str(iterator_trait);
+                err.note(format!(
+                    "`count` is defined on `{iterator_trait}`, which `{rcvr_ty}` does not implement"
+                ));
+            }
+        } else if self.impl_into_iterator_should_be_iterator(rcvr_ty, span, unsatisfied_predicates)
+        {
+            err.span_label(span, format!("`{rcvr_ty}` is not an iterator"));
+            if !span.in_external_macro(self.tcx.sess.source_map()) {
+                err.multipart_suggestion_verbose(
+                    "call `.into_iter()` first",
+                    vec![(span.shrink_to_lo(), format!("into_iter()."))],
+                    Applicability::MaybeIncorrect,
+                );
+            }
+            // Report to emit the diagnostic
+            return true;
+        } else if !unsatisfied_predicates.is_empty() {
+            if matches!(rcvr_ty.kind(), ty::Param(_)) {
+                // We special case the situation where we are looking for `_` in
+                // `<TypeParam as _>::method` because otherwise the machinery will look for blanket
+                // implementations that have unsatisfied trait bounds to suggest, leading us to claim
+                // things like "we're looking for a trait with method `cmp`, both `Iterator` and `Ord`
+                // have one, in order to implement `Ord` you need to restrict `TypeParam: FnPtr` so
+                // that `impl<T: FnPtr> Ord for T` can apply", which is not what we want. We have a type
+                // parameter, we want to directly say "`Ord::cmp` and `Iterator::cmp` exist, restrict
+                // `TypeParam: Ord` or `TypeParam: Iterator`"". That is done further down when calling
+                // `self.suggest_traits_to_import`, so we ignore the `unsatisfied_predicates`
+                // suggestions.
+            } else {
+                self.handle_unsatisfied_predicates(
+                    err,
+                    rcvr_ty,
+                    item_ident,
+                    item_kind,
+                    span,
+                    unsatisfied_predicates,
+                    restrict_type_params,
+                    suggested_derive,
+                    unsatisfied_bounds,
+                    custom_span_label,
+                    bound_spans,
+                );
+            }
+        } else if let ty::Adt(def, targs) = rcvr_ty.kind()
+            && let SelfSource::MethodCall(rcvr_expr) = source
+        {
+            // This is useful for methods on arbitrary self types that might have a simple
+            // mutability difference, like calling a method on `Pin<&mut Self>` that is on
+            // `Pin<&Self>`.
+            if targs.len() == 1 {
+                let mut item_segment = hir::PathSegment::invalid();
+                item_segment.ident = item_ident;
+                for t in [Ty::new_mut_ref, Ty::new_imm_ref, |_, _, t| t] {
+                    let new_args =
+                        tcx.mk_args_from_iter(targs.iter().map(|arg| match arg.as_type() {
+                            Some(ty) => ty::GenericArg::from(t(
+                                tcx,
+                                tcx.lifetimes.re_erased,
+                                ty.peel_refs(),
+                            )),
+                            _ => arg,
+                        }));
+                    let rcvr_ty = Ty::new_adt(tcx, *def, new_args);
+                    if let Ok(method) = self.lookup_method_for_diagnostic(
+                        rcvr_ty,
+                        &item_segment,
+                        span,
+                        tcx.parent_hir_node(rcvr_expr.hir_id).expect_expr(),
+                        rcvr_expr,
+                    ) {
+                        err.span_note(
+                            tcx.def_span(method.def_id),
+                            format!("{item_kind} is available for `{rcvr_ty}`"),
+                        );
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn suggest_surround_method_call(
+        &self,
+        err: &mut Diag<'_>,
+        span: Span,
+        rcvr_ty: Ty<'tcx>,
+        item_ident: Ident,
+        source: SelfSource<'tcx>,
+        similar_candidate: &Option<ty::AssocItem>,
+    ) -> bool {
+        match source {
+            // If the method name is the name of a field with a function or closure type,
+            // give a helping note that it has to be called as `(x.f)(...)`.
+            SelfSource::MethodCall(expr) => {
+                !self.suggest_calling_field_as_fn(span, rcvr_ty, expr, item_ident, err)
+                    && similar_candidate.is_none()
+            }
+            _ => true,
+        }
+    }
+
+    fn find_possible_candidates_for_method(
+        &self,
+        err: &mut Diag<'_>,
+        span: Span,
+        rcvr_ty: Ty<'tcx>,
+        item_ident: Ident,
+        item_kind: &str,
+        mode: Mode,
+        source: SelfSource<'tcx>,
+        no_match_data: &NoMatchData<'tcx>,
+        expected: Expectation<'tcx>,
+        should_label_not_found: bool,
+        custom_span_label: bool,
+    ) {
+        let mut find_candidate_for_method = false;
+        let unsatisfied_predicates = &no_match_data.unsatisfied_predicates;
+
+        if should_label_not_found && !custom_span_label {
+            self.set_not_found_span_label(
+                err,
+                rcvr_ty,
+                item_ident,
+                item_kind,
+                mode,
+                source,
+                span,
+                unsatisfied_predicates,
+                &mut find_candidate_for_method,
+            );
+        }
+        if !find_candidate_for_method {
+            self.lookup_segments_chain_for_no_match_method(
+                err,
+                item_ident,
+                item_kind,
+                source,
+                no_match_data,
+            );
+        }
+
+        // Don't suggest (for example) `expr.field.clone()` if `expr.clone()`
+        // can't be called due to `typeof(expr): Clone` not holding.
+        if unsatisfied_predicates.is_empty() {
+            self.suggest_calling_method_on_field(
+                err,
+                source,
+                span,
+                rcvr_ty,
+                item_ident,
+                expected.only_has_type(self),
+            );
+        }
+    }
+
+    fn suggest_confusable_or_similarly_named_method(
+        &self,
+        err: &mut Diag<'_>,
+        span: Span,
+        rcvr_ty: Ty<'tcx>,
+        item_ident: Ident,
+        mode: Mode,
+        args: Option<&'tcx [hir::Expr<'tcx>]>,
+        unsatisfied_predicates: &UnsatisfiedPredicates<'tcx>,
+        similar_candidate: Option<ty::AssocItem>,
+    ) {
+        let confusable_suggested = self.confusable_method_name(
+            err,
+            rcvr_ty,
+            item_ident,
+            args.map(|args| {
+                args.iter()
+                    .map(|expr| {
+                        self.node_ty_opt(expr.hir_id).unwrap_or_else(|| self.next_ty_var(expr.span))
+                    })
+                    .collect()
+            }),
+        );
+        if let Some(similar_candidate) = similar_candidate {
+            // Don't emit a suggestion if we found an actual method
+            // that had unsatisfied trait bounds
+            if unsatisfied_predicates.is_empty()
+                // ...or if we already suggested that name because of `rustc_confusable` annotation
+                && Some(similar_candidate.name()) != confusable_suggested
+                // and if we aren't in an expansion.
+                && !span.from_expansion()
+            {
+                self.find_likely_intended_associated_item(err, similar_candidate, span, args, mode);
+            }
+        }
+    }
+
+    fn suggest_method_not_found_because_of_unsatisfied_bounds(
+        &self,
+        err: &mut Diag<'_>,
+        rcvr_ty: Ty<'tcx>,
+        item_ident: Ident,
+        item_kind: &str,
+        bound_spans: SortedMap<Span, Vec<String>>,
+    ) {
+        let tcx = self.tcx;
+
+        let mut ty_span = match rcvr_ty.kind() {
+            ty::Param(param_type) => {
+                Some(param_type.span_from_generics(self.tcx, self.body_id.to_def_id()))
+            }
+            ty::Adt(def, _) if def.did().is_local() => Some(tcx.def_span(def.did())),
+            _ => None,
+        };
+        for (span, mut bounds) in bound_spans {
+            if !tcx.sess.source_map().is_span_accessible(span) {
+                continue;
+            }
+            bounds.sort();
+            bounds.dedup();
+            let pre = if Some(span) == ty_span {
+                ty_span.take();
+                format!(
+                    "{item_kind} `{item_ident}` not found for this {} because it ",
+                    rcvr_ty.prefix_string(self.tcx)
+                )
+            } else {
+                String::new()
+            };
+            let msg = match &bounds[..] {
+                [bound] => format!("{pre}doesn't satisfy {bound}"),
+                bounds if bounds.len() > 4 => format!("doesn't satisfy {} bounds", bounds.len()),
+                [bounds @ .., last] => {
+                    format!("{pre}doesn't satisfy {} or {last}", bounds.join(", "))
+                }
+                [] => unreachable!(),
+            };
+            err.span_label(span, msg);
+        }
+        if let Some(span) = ty_span {
+            err.span_label(
+                span,
+                format!(
+                    "{item_kind} `{item_ident}` not found for this {}",
+                    rcvr_ty.prefix_string(self.tcx)
+                ),
+            );
+        }
+    }
+
     fn report_no_match_method_error(
         &self,
         mut span: Span,
@@ -754,235 +1131,67 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             args,
         );
 
-        if let Mode::MethodCall = mode
-            && let SelfSource::MethodCall(cal) = source
-        {
-            self.suggest_await_before_method(
-                &mut err,
-                item_ident,
-                rcvr_ty,
-                cal,
-                span,
-                expected.only_has_type(self),
-            );
-        }
+        self.suggest_method_call_annotation(
+            &mut err, span, rcvr_ty, item_ident, mode, source, expected,
+        );
 
-        self.suggest_on_pointer_type(&mut err, source, rcvr_ty, item_ident);
 
-        if let SelfSource::MethodCall(rcvr_expr) = source {
-            self.suggest_fn_call(&mut err, rcvr_expr, rcvr_ty, |output_ty| {
-                let call_expr = self.tcx.hir_expect_expr(self.tcx.parent_hir_id(rcvr_expr.hir_id));
-                let probe = self.lookup_probe_for_diagnostic(
-                    item_ident,
-                    output_ty,
-                    call_expr,
-                    ProbeScope::AllTraits,
-                    expected.only_has_type(self),
-                );
-                probe.is_ok()
-            });
-            self.note_internal_mutation_in_method(
-                &mut err,
-                rcvr_expr,
-                expected.to_option(self),
-                rcvr_ty,
-            );
-        }
-
-        let mut custom_span_label = false;
-        let mut static_candidates = no_match_data.static_candidates.clone();
-
-        // `static_candidates` may have same candidates appended by
-        // inherent and extension, which may result in incorrect
-        // diagnostic.
-        static_candidates.dedup();
-
-        if !static_candidates.is_empty() {
-            err.note(
-                "found the following associated functions; to be used as methods, \
-                 functions must have a `self` parameter",
-            );
-            err.span_label(span, "this is an associated function, not a method");
-            custom_span_label = true;
-        }
-        if static_candidates.len() == 1 {
-            self.suggest_associated_call_syntax(
-                &mut err,
-                &static_candidates,
-                rcvr_ty,
-                source,
-                item_ident,
-                args,
-                sugg_span,
-            );
-            self.note_candidates_on_method_error(
-                rcvr_ty,
-                item_ident,
-                source,
-                args,
-                span,
-                &mut err,
-                &mut static_candidates,
-                None,
-            );
-        } else if static_candidates.len() > 1 {
-            self.note_candidates_on_method_error(
-                rcvr_ty,
-                item_ident,
-                source,
-                args,
-                span,
-                &mut err,
-                &mut static_candidates,
-                Some(sugg_span),
-            );
-        }
+        let static_candidates = self.suggest_static_method_candidates(
+            &mut err,
+            span,
+            rcvr_ty,
+            item_ident,
+            source,
+            args,
+            sugg_span,
+            &no_match_data,
+        );
+        let mut custom_span_label = !static_candidates.is_empty();
 
         let mut bound_spans: SortedMap<Span, Vec<String>> = Default::default();
         let mut restrict_type_params = false;
         let mut suggested_derive = false;
         let mut unsatisfied_bounds = false;
-        let mut ty_span = match rcvr_ty.kind() {
-            ty::Param(param_type) => {
-                Some(param_type.span_from_generics(self.tcx, self.body_id.to_def_id()))
-            }
-            ty::Adt(def, _) if def.did().is_local() => Some(tcx.def_span(def.did())),
-            _ => None,
-        };
 
-        if item_ident.name == sym::count && self.is_slice_ty(rcvr_ty, span) {
-            let msg = "consider using `len` instead";
-            if let SelfSource::MethodCall(_expr) = source {
-                err.span_suggestion_short(span, msg, "len", Applicability::MachineApplicable);
-            } else {
-                err.span_label(span, msg);
-            }
-            if let Some(iterator_trait) = self.tcx.get_diagnostic_item(sym::Iterator) {
-                let iterator_trait = self.tcx.def_path_str(iterator_trait);
-                err.note(format!(
-                    "`count` is defined on `{iterator_trait}`, which `{rcvr_ty}` does not implement"
-                ));
-            }
-        } else if self.impl_into_iterator_should_be_iterator(rcvr_ty, span, unsatisfied_predicates)
-        {
-            err.span_label(span, format!("`{rcvr_ty}` is not an iterator"));
-            if !span.in_external_macro(self.tcx.sess.source_map()) {
-                err.multipart_suggestion_verbose(
-                    "call `.into_iter()` first",
-                    vec![(span.shrink_to_lo(), format!("into_iter()."))],
-                    Applicability::MaybeIncorrect,
-                );
-            }
+        if self.suggest_unsatisfied_ty_or_trait(
+            &mut err,
+            span,
+            rcvr_ty,
+            item_ident,
+            item_kind,
+            source,
+            unsatisfied_predicates,
+            &mut restrict_type_params,
+            &mut suggested_derive,
+            &mut unsatisfied_bounds,
+            &mut custom_span_label,
+            &mut bound_spans,
+        ) {
             return err.emit();
-        } else if !unsatisfied_predicates.is_empty() {
-            if matches!(rcvr_ty.kind(), ty::Param(_)) {
-                // We special case the situation where we are looking for `_` in
-                // `<TypeParam as _>::method` because otherwise the machinery will look for blanket
-                // implementations that have unsatisfied trait bounds to suggest, leading us to claim
-                // things like "we're looking for a trait with method `cmp`, both `Iterator` and `Ord`
-                // have one, in order to implement `Ord` you need to restrict `TypeParam: FnPtr` so
-                // that `impl<T: FnPtr> Ord for T` can apply", which is not what we want. We have a type
-                // parameter, we want to directly say "`Ord::cmp` and `Iterator::cmp` exist, restrict
-                // `TypeParam: Ord` or `TypeParam: Iterator`"". That is done further down when calling
-                // `self.suggest_traits_to_import`, so we ignore the `unsatisfied_predicates`
-                // suggestions.
-            } else {
-                self.handle_unsatisfied_predicates(
-                    &mut err,
-                    rcvr_ty,
-                    item_ident,
-                    item_kind,
-                    span,
-                    unsatisfied_predicates,
-                    &mut restrict_type_params,
-                    &mut suggested_derive,
-                    &mut unsatisfied_bounds,
-                    &mut custom_span_label,
-                    &mut bound_spans,
-                );
-            }
-        } else if let ty::Adt(def, targs) = rcvr_ty.kind()
-            && let SelfSource::MethodCall(rcvr_expr) = source
-        {
-            // This is useful for methods on arbitrary self types that might have a simple
-            // mutability difference, like calling a method on `Pin<&mut Self>` that is on
-            // `Pin<&Self>`.
-            if targs.len() == 1 {
-                let mut item_segment = hir::PathSegment::invalid();
-                item_segment.ident = item_ident;
-                for t in [Ty::new_mut_ref, Ty::new_imm_ref, |_, _, t| t] {
-                    let new_args =
-                        tcx.mk_args_from_iter(targs.iter().map(|arg| match arg.as_type() {
-                            Some(ty) => ty::GenericArg::from(t(
-                                tcx,
-                                tcx.lifetimes.re_erased,
-                                ty.peel_refs(),
-                            )),
-                            _ => arg,
-                        }));
-                    let rcvr_ty = Ty::new_adt(tcx, *def, new_args);
-                    if let Ok(method) = self.lookup_method_for_diagnostic(
-                        rcvr_ty,
-                        &item_segment,
-                        span,
-                        tcx.parent_hir_node(rcvr_expr.hir_id).expect_expr(),
-                        rcvr_expr,
-                    ) {
-                        err.span_note(
-                            tcx.def_span(method.def_id),
-                            format!("{item_kind} is available for `{rcvr_ty}`"),
-                        );
-                    }
-                }
-            }
         }
 
-        let mut find_candidate_for_method = false;
-        let should_label_not_found = match source {
-            // If the method name is the name of a field with a function or closure type,
-            // give a helping note that it has to be called as `(x.f)(...)`.
-            SelfSource::MethodCall(expr) => {
-                !self.suggest_calling_field_as_fn(span, rcvr_ty, expr, item_ident, &mut err)
-                    && similar_candidate.is_none()
-            }
-            _ => true,
-        };
+        let should_label_not_found = self.suggest_surround_method_call(
+            &mut err,
+            span,
+            rcvr_ty,
+            item_ident,
+            source,
+            &similar_candidate,
+        );
 
-        if should_label_not_found && !custom_span_label {
-            self.set_not_found_span_label(
-                &mut err,
-                rcvr_ty,
-                item_ident,
-                item_kind,
-                mode,
-                source,
-                span,
-                unsatisfied_predicates,
-                &mut find_candidate_for_method,
-            );
-        }
-        if !find_candidate_for_method {
-            self.lookup_segments_chain_for_no_match_method(
-                &mut err,
-                item_ident,
-                item_kind,
-                source,
-                no_match_data,
-            );
-        }
-
-        // Don't suggest (for example) `expr.field.clone()` if `expr.clone()`
-        // can't be called due to `typeof(expr): Clone` not holding.
-        if unsatisfied_predicates.is_empty() {
-            self.suggest_calling_method_on_field(
-                &mut err,
-                source,
-                span,
-                rcvr_ty,
-                item_ident,
-                expected.only_has_type(self),
-            );
-        }
+        self.find_possible_candidates_for_method(
+            &mut err,
+            span,
+            rcvr_ty,
+            item_ident,
+            item_kind,
+            mode,
+            source,
+            no_match_data,
+            expected,
+            should_label_not_found,
+            custom_span_label,
+        );
 
         self.suggest_unwrapping_inner_self(&mut err, source, rcvr_ty, item_ident);
 
@@ -1012,71 +1221,25 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             source,
             unsatisfied_predicates,
         );
-        let confusable_suggested = self.confusable_method_name(
+
+        self.suggest_confusable_or_similarly_named_method(
+            &mut err,
+            span,
+            rcvr_ty,
+            item_ident,
+            mode,
+            args,
+            unsatisfied_predicates,
+            similar_candidate,
+        );
+
+        self.suggest_method_not_found_because_of_unsatisfied_bounds(
             &mut err,
             rcvr_ty,
             item_ident,
-            args.map(|args| {
-                args.iter()
-                    .map(|expr| {
-                        self.node_ty_opt(expr.hir_id).unwrap_or_else(|| self.next_ty_var(expr.span))
-                    })
-                    .collect()
-            }),
+            item_kind,
+            bound_spans,
         );
-        if let Some(similar_candidate) = similar_candidate {
-            // Don't emit a suggestion if we found an actual method
-            // that had unsatisfied trait bounds
-            if unsatisfied_predicates.is_empty()
-                // ...or if we already suggested that name because of `rustc_confusable` annotation
-                && Some(similar_candidate.name()) != confusable_suggested
-                // and if we aren't in an expansion.
-                && !span.from_expansion()
-            {
-                self.find_likely_intended_associated_item(
-                    &mut err,
-                    similar_candidate,
-                    span,
-                    args,
-                    mode,
-                );
-            }
-        }
-
-        for (span, mut bounds) in bound_spans {
-            if !tcx.sess.source_map().is_span_accessible(span) {
-                continue;
-            }
-            bounds.sort();
-            bounds.dedup();
-            let pre = if Some(span) == ty_span {
-                ty_span.take();
-                format!(
-                    "{item_kind} `{item_ident}` not found for this {} because it ",
-                    rcvr_ty.prefix_string(self.tcx)
-                )
-            } else {
-                String::new()
-            };
-            let msg = match &bounds[..] {
-                [bound] => format!("{pre}doesn't satisfy {bound}"),
-                bounds if bounds.len() > 4 => format!("doesn't satisfy {} bounds", bounds.len()),
-                [bounds @ .., last] => {
-                    format!("{pre}doesn't satisfy {} or {last}", bounds.join(", "))
-                }
-                [] => unreachable!(),
-            };
-            err.span_label(span, msg);
-        }
-        if let Some(span) = ty_span {
-            err.span_label(
-                span,
-                format!(
-                    "{item_kind} `{item_ident}` not found for this {}",
-                    rcvr_ty.prefix_string(self.tcx)
-                ),
-            );
-        }
 
         self.note_derefed_ty_has_method(&mut err, source, rcvr_ty, item_ident, expected);
         err.emit()
