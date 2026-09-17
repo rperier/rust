@@ -228,6 +228,7 @@ late_lint_methods!(
             DefaultCouldBeDerived: DefaultCouldBeDerived,
             DerefIntoDynSupertrait: DerefIntoDynSupertrait,
             DerefNullPtr: DerefNullPtr,
+            FnDirectUseOfUnsafeOpOnArgs: FnDirectUseOfUnsafeOpOnArgs,
             DropForgetUseless: DropForgetUseless,
             DropTraitConstraints: DropTraitConstraints,
             EnumIntrinsicsNonEnums: EnumIntrinsicsNonEnums,

@@ -8,6 +8,7 @@
 
 #![stable(feature = "core_ffi", since = "1.30.0")]
 #![allow(non_camel_case_types)]
+#![allow(safe_fn_direct_use_of_unsafe_op_on_args)]
 
 #[doc(inline)]
 #[stable(feature = "core_c_str", since = "1.64.0")]
